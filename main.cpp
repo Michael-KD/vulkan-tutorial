@@ -5,6 +5,7 @@
 #include <GLFW/glfw3.h>
 #define GLFW_EXPOSE_NATIVE_WIN32
 #define GLM_FORCE_RADIANS
+//#define GLM_FORCE_DEFAULT_ALIGNED_GENTYPES
 
 #include <GLFW/glfw3native.h>
 #include <glm/glm.hpp>
@@ -111,11 +112,10 @@ struct Vertex {
 
 // MODEL VIEW PROJECTION MATRIX
 struct UniformBufferObject {
-	glm::mat4 model;
-	glm::mat4 view;
-	glm::mat4 proj;
+	alignas(16) glm::mat4 model;
+	alignas(16) glm::mat4 view;
+	alignas(16) glm::mat4 proj;
 };
-
 
 
 // VERTEX AND INDEX DATA
@@ -184,6 +184,8 @@ private:
 	std::vector<VkDeviceMemory> uniformBuffersMemory;
 	std::vector<void*> uniformBuffersMapped;
 
+	VkDescriptorPool descriptorPool;
+	std::vector<VkDescriptorSet> descriptorSets;
 
 
 	bool framebufferResized = false;
@@ -216,7 +218,10 @@ private:
 		createCommandPool();
 		createVertexBuffer();
 		createIndexBuffer();
-		createCommandBuffer();
+		createUniformBuffers();
+		createDescriptorPool();
+		createDescriptorSets();
+		createCommandBuffers();
 		createSyncObjects();
 
 	}
@@ -250,24 +255,24 @@ private:
 	void cleanup() {
 		cleanupSwapChain();
 
+		vkDestroyPipeline(device, graphicsPipeline, nullptr);
+		vkDestroyPipelineLayout(device, pipelineLayout, nullptr);
+		vkDestroyRenderPass(device, renderPass, nullptr);
+
 		for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
 			vkDestroyBuffer(device, uniformBuffers[i], nullptr);
 			vkFreeMemory(device, uniformBuffersMemory[i], nullptr);
 		}
 
-		vkDestroyDescriptorSetLayout(device, descriptorSetLayout, nullptr);
+		vkDestroyDescriptorPool(device, descriptorPool, nullptr);
 
+		vkDestroyDescriptorSetLayout(device, descriptorSetLayout, nullptr);
 
 		vkDestroyBuffer(device, indexBuffer, nullptr);
 		vkFreeMemory(device, indexBufferMemory, nullptr);
 
 		vkDestroyBuffer(device, vertexBuffer, nullptr);
 		vkFreeMemory(device, vertexBufferMemory, nullptr);
-
-		vkDestroyPipeline(device, graphicsPipeline, nullptr);
-		vkDestroyPipelineLayout(device, pipelineLayout, nullptr);
-
-		vkDestroyRenderPass(device, renderPass, nullptr);
 
 		for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
 			vkDestroySemaphore(device, renderFinishedSemaphores[i], nullptr);
@@ -276,6 +281,7 @@ private:
 		}
 
 		vkDestroyCommandPool(device, commandPool, nullptr);
+
 		vkDestroyDevice(device, nullptr);
 
 		if (enableValidationLayers) {
@@ -286,21 +292,20 @@ private:
 		vkDestroyInstance(instance, nullptr);
 
 		glfwDestroyWindow(window);
+
 		glfwTerminate();
 	}
 
-	// DESCRIPTOR SET LAYOUT FUNCTIONS
+	// DESCRIPTOR FUNCTIONS
 
 	void createDescriptorSetLayout() {
 		VkDescriptorSetLayoutBinding uboLayoutBinding{};
 		uboLayoutBinding.binding = 0;
-		uboLayoutBinding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
 		uboLayoutBinding.descriptorCount = 1;
+		uboLayoutBinding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+		uboLayoutBinding.pImmutableSamplers = nullptr;
 		uboLayoutBinding.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
-		uboLayoutBinding.pImmutableSamplers = nullptr; // Optional
-	
-		VkDescriptorSetLayout descriptorSetLayout;
-		VkPipelineLayout pipelineLayout;
+
 		VkDescriptorSetLayoutCreateInfo layoutInfo{};
 		layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
 		layoutInfo.bindingCount = 1;
@@ -309,15 +314,55 @@ private:
 		if (vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &descriptorSetLayout) != VK_SUCCESS) {
 			throw std::runtime_error("failed to create descriptor set layout!");
 		}
-
-		VkPipelineLayoutCreateInfo pipelineLayoutInfo{};
-		pipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-		pipelineLayoutInfo.setLayoutCount = 1;
-		pipelineLayoutInfo.pSetLayouts = &descriptorSetLayout;
-
 	}
 
+	void createDescriptorPool() {
+		VkDescriptorPoolSize poolSize{};
+		poolSize.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+		poolSize.descriptorCount = static_cast<uint32_t>(MAX_FRAMES_IN_FLIGHT);
 
+		VkDescriptorPoolCreateInfo poolInfo{};
+		poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+		poolInfo.poolSizeCount = 1;
+		poolInfo.pPoolSizes = &poolSize;
+		poolInfo.maxSets = static_cast<uint32_t>(MAX_FRAMES_IN_FLIGHT);
+
+		if (vkCreateDescriptorPool(device, &poolInfo, nullptr, &descriptorPool) != VK_SUCCESS) {
+			throw std::runtime_error("failed to create descriptor pool!");
+		}
+	}
+
+	void createDescriptorSets() {
+		std::vector<VkDescriptorSetLayout> layouts(MAX_FRAMES_IN_FLIGHT, descriptorSetLayout);
+		VkDescriptorSetAllocateInfo allocInfo{};
+		allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+		allocInfo.descriptorPool = descriptorPool;
+		allocInfo.descriptorSetCount = static_cast<uint32_t>(MAX_FRAMES_IN_FLIGHT);
+		allocInfo.pSetLayouts = layouts.data();
+
+		descriptorSets.resize(MAX_FRAMES_IN_FLIGHT);
+		if (vkAllocateDescriptorSets(device, &allocInfo, descriptorSets.data()) != VK_SUCCESS) {
+			throw std::runtime_error("failed to allocate descriptor sets!");
+		}
+
+		for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
+			VkDescriptorBufferInfo bufferInfo{};
+			bufferInfo.buffer = uniformBuffers[i];
+			bufferInfo.offset = 0;
+			bufferInfo.range = sizeof(UniformBufferObject);
+
+			VkWriteDescriptorSet descriptorWrite{};
+			descriptorWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+			descriptorWrite.dstSet = descriptorSets[i];
+			descriptorWrite.dstBinding = 0;
+			descriptorWrite.dstArrayElement = 0;
+			descriptorWrite.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+			descriptorWrite.descriptorCount = 1;
+			descriptorWrite.pBufferInfo = &bufferInfo;
+
+			vkUpdateDescriptorSets(device, 1, &descriptorWrite, 0, nullptr);
+		}
+	}
 
 
 
@@ -577,7 +622,7 @@ private:
 
 	}
 
-	void createCommandBuffer() {
+	void createCommandBuffers() {
 		commandBuffers.resize(MAX_FRAMES_IN_FLIGHT);
 
 		VkCommandBufferAllocateInfo allocInfo{};
@@ -595,8 +640,6 @@ private:
 	void recordCommandBuffer(VkCommandBuffer commandBuffer, uint32_t imageIndex) {
 		VkCommandBufferBeginInfo beginInfo{};
 		beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-		beginInfo.flags = 0; // Optional
-		beginInfo.pInheritanceInfo = nullptr; // Optional
 
 		if (vkBeginCommandBuffer(commandBuffer, &beginInfo) != VK_SUCCESS) {
 			throw std::runtime_error("failed to begin recording command buffer!");
@@ -608,9 +651,11 @@ private:
 		renderPassInfo.framebuffer = swapChainFramebuffers[imageIndex];
 		renderPassInfo.renderArea.offset = { 0, 0 };
 		renderPassInfo.renderArea.extent = swapChainExtent;
+
 		VkClearValue clearColor = { {{0.0f, 0.0f, 0.0f, 1.0f}} };
 		renderPassInfo.clearValueCount = 1;
 		renderPassInfo.pClearValues = &clearColor;
+
 		vkCmdBeginRenderPass(commandBuffer, &renderPassInfo, VK_SUBPASS_CONTENTS_INLINE);
 
 		vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, graphicsPipeline);
@@ -632,7 +677,10 @@ private:
 		VkBuffer vertexBuffers[] = { vertexBuffer };
 		VkDeviceSize offsets[] = { 0 };
 		vkCmdBindVertexBuffers(commandBuffer, 0, 1, vertexBuffers, offsets);
+
 		vkCmdBindIndexBuffer(commandBuffer, indexBuffer, 0, VK_INDEX_TYPE_UINT16);
+
+		vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout, 0, 1, &descriptorSets[currentFrame], 0, nullptr);
 
 		vkCmdDrawIndexed(commandBuffer, static_cast<uint32_t>(indices.size()), 1, 0, 0, 0);
 
@@ -641,6 +689,7 @@ private:
 		if (vkEndCommandBuffer(commandBuffer) != VK_SUCCESS) {
 			throw std::runtime_error("failed to record command buffer!");
 		}
+
 	}
 
 
@@ -764,7 +813,7 @@ private:
 		rasterizer.polygonMode = VK_POLYGON_MODE_FILL;
 		rasterizer.lineWidth = 1.0f;
 		rasterizer.cullMode = VK_CULL_MODE_BACK_BIT;
-		rasterizer.frontFace = VK_FRONT_FACE_CLOCKWISE;
+		rasterizer.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
 		rasterizer.depthBiasEnable = VK_FALSE;
 		rasterizer.depthBiasConstantFactor = 0.0f; // Optional
 		rasterizer.depthBiasClamp = 0.0f; // Optional
@@ -810,10 +859,8 @@ private:
 
 		VkPipelineLayoutCreateInfo pipelineLayoutInfo{};
 		pipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-		pipelineLayoutInfo.setLayoutCount = 0; // Optional
-		pipelineLayoutInfo.pSetLayouts = nullptr; // Optional
-		pipelineLayoutInfo.pushConstantRangeCount = 0; // Optional
-		pipelineLayoutInfo.pPushConstantRanges = nullptr; // Optional
+		pipelineLayoutInfo.setLayoutCount = 1;
+		pipelineLayoutInfo.pSetLayouts = &descriptorSetLayout;
 
 		if (vkCreatePipelineLayout(device, &pipelineLayoutInfo, nullptr, &pipelineLayout) != VK_SUCCESS) {
 			throw std::runtime_error("failed to create pipeline layout!");
