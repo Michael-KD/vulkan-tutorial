@@ -21,9 +21,9 @@
   </ItemGroup>
   <ItemGroup>
     <None Include="shaders\shader.frag" />
-    <None Include="compile.bat">
+    <None Include="shaders\shader.vert" />
+    <None Include="shaders\compile.bat">
       <Filter>Source Files</Filter>
     </None>
-    <None Include="shaders\shader.vert" />
   </ItemGroup>
 </Project>
